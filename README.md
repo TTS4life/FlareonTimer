@@ -21,4 +21,6 @@ To modify your offsets, alter the `timers.json`.
 
 To alter hotkeys for interacting with the tool, modify `config.json`
 
+If using the .exe version, these json files are under `_internal/assets`, otherwise just `/assets`
+
 All development and maintenance has been done by Flareon, I am only hosting this on his behalf per his request. This program comes as-is for now. 
