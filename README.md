@@ -10,7 +10,7 @@ If using the uncompiled version, clone the repo and run
 python3 flareontimer.py
 ```
 
-Note: Will need sounddevice from pip or another python package distribution of your choice.
+Note: Will need sounddevice among others from pip or another python package distribution of your choice. Should be easy to tell what you're missing if you know what you're doing.
 
 
 Otherwise, if using Windows, you can use the included .exe in the Releases section.
