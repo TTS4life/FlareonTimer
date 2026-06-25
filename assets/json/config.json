@@ -1,0 +1,19 @@
+{
+    "fps": 59.727500569606,
+    "beep": {
+        "name":   "click.wav",
+        "volume": 1.0
+    },
+    "keybinds": {
+        "start_restart":  "\r",
+        "next":           "n",
+        "reset":          "r",
+        "terminate":      "\u001b",
+        "variable_frame": "v",
+        "add":            "+",
+        "subtract":       "-",
+        "add_all":        "*",
+        "subtract_all":   "_"
+    },
+    "print_target_beep": true
+}

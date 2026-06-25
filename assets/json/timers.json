@@ -1,0 +1,32 @@
+{
+    "Mudkip": {
+        "offsets":               [11289, 19895, 25018, 30103, 56867],
+        "variable_frame_offset": -7,
+        "interval":              250,
+        "number_beeps":          5
+    },
+    "Zigzagoon": {
+        "offsets":               [7534, 20761, 22787, 40099, 41874, 52229, 58918, 63714, 69876, 74991, 76456, 80022, 81855, 86895, 98690],
+        "variable_frame_offset": -5,
+        "interval":              250,
+        "number_beeps":          5
+    },
+    "Wingull/Poochyena": {
+        "offsets":               [7241, 23490, 25516, 43012, 52924, 77477, 84710, 89243, 94626, 96877, 101984, 103692, 105684, 109024, 110841, 112306, 115755],
+        "variable_frame_offset": -4.75,
+        "interval":              250,
+        "number_beeps":          5
+    },
+    "Roxanne": {
+        "offsets":               [17165, 28433, 39467, 46842, 57825, 65100, 75631, 82303, 94592, 99473],
+        "variable_frame_offset": -5.75,
+        "interval":              250,
+        "number_beeps":          5
+    },
+    "Abra": {
+        "offsets":               [7191, 20995, 23030],
+        "variable_frame_offset": -7,
+        "interval":              250,
+        "number_beeps":          5
+    }
+}
