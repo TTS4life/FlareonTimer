@@ -52,7 +52,12 @@ class Runner:
 
     def snapshot(self):
         with self.lock:
-            return {"name": self.name, "start_ns": self.start_ns, "pending": list(self.pending)}
+            return {
+                "name":     self.name,
+                "start_ns": self.start_ns,
+                "pending":  list(self.pending),
+                "revision": self.revision,
+            }
 
     def start(self, name, configuration):
         if self.running(): return False
@@ -135,6 +140,11 @@ class Runner:
 
     def settle_queue(self, start):
         """Appends a queued variable frame once the next beep is clear of it."""
+        # Checked without the lock first: this runs every millisecond of every
+        # wait, and is almost always negative. A late-arriving queue entry is
+        # simply picked up on the next pass.
+        if self.queued is None: return
+
         message = None
 
         with self.lock:

@@ -6,13 +6,14 @@ a temporary copy of timers.json - the shipped file is never written to.
 
 import copy
 import json
-import queue
 import shutil
 import time
 
 import pytest
 
 tkinter = pytest.importorskip("tkinter")
+
+from helpers import wait_for
 
 import src.config
 import src.settings
@@ -50,9 +51,6 @@ def app(tk_root, tmp_path, monkeypatch):
     monkeypatch.setattr(src.ui.messagebox, "askyesno",       lambda *args, **kwargs: True)
     monkeypatch.setattr(src.ui.messagebox, "askyesnocancel", lambda *args, **kwargs: False)
 
-    # the engine shares src.config.timers, so publish() must not leak between tests
-    monkeypatch.setattr(src.ui, "timers_in_memory", copy.deepcopy(src.config.timers))
-
     # rebinding mutates the shared src.config.config dict in place
     original_config = copy.deepcopy(src.ui.config)
 
@@ -74,22 +72,19 @@ def reload(application):
     with open(application.path) as file_timers: return json.load(file_timers)
 
 
-def wait_for(application, kind, timeout = 10.0):
-    """Waits for a runner event. The tick loop only drains these under
-    mainloop, which is not running here, so the queue is ours."""
-    deadline = time.monotonic() + timeout
-
-    while time.monotonic() < deadline:
-        try: event = application.runner.events.get(timeout = 0.05)
-        except queue.Empty: continue
-
-        if event["kind"] == kind: return event
-
-    raise AssertionError(f"timed out waiting for {kind!r}")
-
-
 def row_named(application, name):
     return next(row for row in application.timer_rows if row.name == name)
+
+
+def start_run(app, offsets = (20_000,), name = "Abra"):
+    """Starts `name` on the given offsets and waits for the run to begin."""
+    app.timers[name]["offsets"] = list(offsets)
+    app.active.set(name)
+    app.on_start()
+
+    wait_for(app.runner.events, "started")
+
+    return app
 
 
 class TestTimerList:
@@ -349,17 +344,27 @@ class TestPersistence:
         assert not data.endswith(b"\n")
         assert b'"offsets":               [' in data
 
-    def test_saving_publishes_to_the_engine(self, app):
-        """The engine reads src.config.timers, so saved edits must land there."""
+    def test_only_the_changed_file_is_written(self, app):
+        """Editing offsets must not rewrite config.json, and vice versa."""
+        before = app.config_path.read_bytes()
+
         row_named(app, "Mudkip").interval.set("300")
         app.on_save()
 
-        assert src.ui.timers_in_memory["Mudkip"]["interval"] == 300
+        assert reload(app)["Mudkip"]["interval"] == 300
+        assert app.config_path.read_bytes() == before
+        assert "timers.json" in app.label_status.cget("text")
+        assert "config.json" not in app.label_status.cget("text")
 
-    def test_editing_does_not_publish_before_saving(self, app):
-        row_named(app, "Mudkip").interval.set("300")
+    def test_a_keybind_change_does_not_rewrite_timers(self, app):
+        before = app.path.read_bytes()
 
-        assert src.ui.timers_in_memory["Mudkip"]["interval"] == 250
+        app.on_capture("next")
+        press(app, "k")
+        app.on_save()
+
+        assert app.path.read_bytes() == before
+        assert "config.json" in app.label_status.cget("text")
 
 
 class TestDirtyState:
@@ -442,13 +447,13 @@ class TestStarting:
         app.active.set("Abra")
         app.on_start()
 
-        assert wait_for(app, "started")["name"] == "Abra"
+        assert wait_for(app.runner.events, "started")["name"] == "Abra"
 
     def test_does_not_close_the_window(self, app, closed):
         make_quick(app, "Abra")
         app.active.set("Abra")
         app.on_start()
-        wait_for(app, "finished")
+        wait_for(app.runner.events, "finished")
 
         assert closed == []
 
@@ -457,7 +462,7 @@ class TestStarting:
         app.active.set("Abra")
         app.on_start()
 
-        assert wait_for(app, "finished")["name"] == "Abra"
+        assert wait_for(app.runner.events, "finished")["name"] == "Abra"
 
     def test_uses_unsaved_interval_and_beeps_edits(self, app):
         """Starting picks up what is in the boxes, without needing a save."""
@@ -466,7 +471,7 @@ class TestStarting:
         row_named(app, "Mudkip").beeps.set("5")
 
         app.on_start()
-        wait_for(app, "started")
+        wait_for(app.runner.events, "started")
 
         # lead-in is 500 * 4, so the sequence starts at 1000 ms
         assert app.runner.snapshot()["pending"][0] == (1000, 3000)
@@ -484,7 +489,7 @@ class TestStarting:
         make_quick(app, "Abra")
         app.active.set("Abra")
         app.on_start()
-        wait_for(app, "finished")
+        wait_for(app.runner.events, "finished")
 
         assert reload(app) == original
 
@@ -494,29 +499,29 @@ class TestStopping:
         app.timers["Abra"]["offsets"] = [60_000]
         app.active.set("Abra")
         app.on_start()
-        wait_for(app, "started")
+        wait_for(app.runner.events, "started")
 
         app.on_stop()
 
-        assert wait_for(app, "stopped")["name"] == "Abra"
+        assert wait_for(app.runner.events, "stopped")["name"] == "Abra"
 
     def test_the_stop_button_is_what_stops(self, app):
         """Start doubles as Restart while running, so Stop has its own button."""
         app.timers["Abra"]["offsets"] = [60_000]
         app.active.set("Abra")
         app.on_start()
-        wait_for(app, "started")
+        wait_for(app.runner.events, "started")
 
         app.on_stop()
 
-        assert wait_for(app, "stopped")["name"] == "Abra"
+        assert wait_for(app.runner.events, "stopped")["name"] == "Abra"
         assert app.restarting is False
 
     def test_closing_stops_the_runner(self, app, closed):
         app.timers["Abra"]["offsets"] = [60_000]
         app.active.set("Abra")
         app.on_start()
-        wait_for(app, "started")
+        wait_for(app.runner.events, "started")
 
         app.on_close()
 
@@ -529,7 +534,7 @@ class TestRunControls:
         app.timers["Abra"]["offsets"] = [60_000]
         app.active.set("Abra")
         app.on_start()
-        wait_for(app, "started")
+        wait_for(app.runner.events, "started")
         app.refresh_controls()
 
         assert app.button_start.cget("text") == "Restart timer"
@@ -539,7 +544,7 @@ class TestRunControls:
         app.timers["Abra"]["offsets"] = [60_000]
         app.active.set("Abra")
         app.on_start()
-        wait_for(app, "started")
+        wait_for(app.runner.events, "started")
         app.refresh_controls()
 
         assert all("disabled" in row.radio.state() for row in app.timer_rows)
@@ -549,7 +554,7 @@ class TestRunControls:
         make_quick(app, "Abra")
         app.active.set("Abra")
         app.on_start()
-        wait_for(app, "finished")
+        wait_for(app.runner.events, "finished")
         app.runner.join(timeout = 5.0)
         app.refresh_controls()
 
@@ -565,7 +570,7 @@ class TestRunControls:
         app.timers["Abra"]["offsets"] = [60_000]
         app.active.set("Abra")
         app.on_start()
-        wait_for(app, "started")
+        wait_for(app.runner.events, "started")
         app.refresh_run()
 
         text = app.label_run.cget("text")
@@ -577,7 +582,7 @@ class TestRunControls:
         make_quick(app, "Abra")
         app.active.set("Abra")
         app.on_start()
-        wait_for(app, "finished")
+        wait_for(app.runner.events, "finished")
 
         app.runner.events.put({"kind": "beep", "name": "Abra", "target": 200.0,
                                "planned": 200, "delay": 0.4, "average": 0.4, "remaining": 0})
@@ -606,17 +611,17 @@ class TestHotkeys:
 
         press(app, bind_for("start_restart"), "Return")
 
-        assert wait_for(app, "started")["name"] == "Abra"
+        assert wait_for(app.runner.events, "started")["name"] == "Abra"
 
     def test_start_keybind_stops_a_running_timer(self, app):
         app.timers["Abra"]["offsets"] = [60_000]
         app.active.set("Abra")
         app.on_start()
-        wait_for(app, "started")
+        wait_for(app.runner.events, "started")
 
         press(app, bind_for("start_restart"), "Return")
 
-        assert wait_for(app, "stopped")["name"] == "Abra"
+        assert wait_for(app.runner.events, "stopped")["name"] == "Abra"
 
     def test_next_moves_the_active_timer_down(self, app):
         press(app, bind_for("next"))
@@ -646,7 +651,7 @@ class TestHotkeys:
         app.timers["Abra"]["offsets"] = [60_000]
         app.active.set("Abra")
         app.on_start()
-        wait_for(app, "started")
+        wait_for(app.runner.events, "started")
 
         press(app, bind_for("next"))
 
@@ -658,6 +663,23 @@ class TestHotkeys:
         press(app, bind_for("start_restart"), "Return")
 
         assert app.runner.running() is False
+
+    def test_a_modifier_keypress_triggers_nothing(self, app, monkeypatch):
+        """A modifier arrives with event.char == "", and binding() returns ""
+        for an action config.json does not define. The two must not match."""
+        monkeypatch.delitem(src.ui.config["keybinds"], "variable_frame")
+
+        press(app, "", "Shift_L")
+
+        assert app.runner.running() is False
+        assert app.label_status.cget("text") == ""
+
+    def test_a_modifier_does_not_move_the_active_timer(self, app, monkeypatch):
+        monkeypatch.delitem(src.ui.config["keybinds"], "next")
+
+        press(app, "", "Control_L")
+
+        assert app.active.get() == "Mudkip"
 
     def test_hotkeys_are_ignored_on_the_settings_tab(self, app):
         app.notebook.select(app.tab_settings)
@@ -686,15 +708,8 @@ def pump(app, predicate, timeout = 10.0):
 
 
 class TestRestart:
-    def running_app(self, app, offsets = (60_000,)):
-        app.timers["Abra"]["offsets"] = list(offsets)
-        app.active.set("Abra")
-        app.on_start()
-        wait_for(app, "started")
-        return app
-
     def test_button_reads_restart_while_running(self, app):
-        self.running_app(app)
+        start_run(app)
         app.refresh_controls()
 
         assert app.button_start.cget("text") == "Restart timer"
@@ -710,13 +725,13 @@ class TestRestart:
         assert "disabled" in app.button_stop.state()
 
     def test_stop_button_is_enabled_while_running(self, app):
-        self.running_app(app)
+        start_run(app)
         app.refresh_controls()
 
         assert "disabled" not in app.button_stop.state()
 
     def test_restart_starts_a_fresh_run(self, app):
-        self.running_app(app)
+        start_run(app)
         first = app.runner.snapshot()["start_ns"]
 
         app.on_start()   # the button doubles as Restart while running
@@ -725,7 +740,7 @@ class TestRestart:
                               and app.runner.snapshot()["start_ns"] not in (None, first))
 
     def test_restart_resets_the_pending_offsets(self, app):
-        self.running_app(app, offsets = (60_000, 70_000))
+        start_run(app, offsets = (60_000, 70_000))
         app.on_shift("add")
 
         assert app.runner.snapshot()["pending"][0][1] != 60_000
@@ -736,7 +751,7 @@ class TestRestart:
         assert app.runner.snapshot()["pending"][0][1] == 60_000, "the shift should not survive a restart"
 
     def test_restart_leaves_exactly_one_run_going(self, app):
-        self.running_app(app)
+        start_run(app)
 
         app.on_start()
         pump(app, lambda: not app.restarting)
@@ -745,7 +760,7 @@ class TestRestart:
         assert app.restarting is False
 
     def test_the_keybind_restarts(self, app):
-        self.running_app(app)
+        start_run(app)
         first = app.runner.snapshot()["start_ns"]
 
         press(app, bind_for("start_restart"), "Return")
@@ -759,11 +774,11 @@ class TestRestart:
 
         press(app, bind_for("start_restart"), "Return")
 
-        assert wait_for(app, "started")["name"] == "Abra"
+        assert wait_for(app.runner.events, "started")["name"] == "Abra"
 
     def test_controls_stay_live_across_the_handover(self, app):
         """The window must not flick back to its idle state mid-restart."""
-        self.running_app(app)
+        start_run(app)
 
         app.on_restart()
         app.refresh_controls()
@@ -773,42 +788,64 @@ class TestRestart:
         assert "disabled" not in app.button_stop.state()
 
     def test_stop_button_ends_the_run(self, app):
-        self.running_app(app)
+        start_run(app)
 
         app.on_stop()
 
-        assert wait_for(app, "stopped")["name"] == "Abra"
+        assert wait_for(app.runner.events, "stopped")["name"] == "Abra"
         assert app.restarting is False
 
-    def test_stop_during_a_restart_cancels_it(self, app):
-        self.running_app(app)
+    def test_stop_during_a_restart_actually_stops(self, app):
+        """Asserts the outcome, not the flag.
+
+        The earlier version of this test checked `restarting is False` and its
+        pump returned the moment the old thread died - so it passed while the
+        queued handover went on to start a fresh run behind it.
+        """
+        start_run(app)
 
         app.on_restart()
         app.on_stop()
-        pump(app, lambda: not app.runner.running(), timeout = 5.0)
 
+        # keep the loop turning well past the 10 ms handover poll
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            app.root.update()
+            time.sleep(0.01)
+
+        assert app.runner.running() is False, "Stop was ignored: the restart started a new run anyway"
         assert app.restarting is False
+
+    def test_mashing_restart_settles_on_one_run(self, app):
+        start_run(app)
+
+        for _ in range(5): app.on_restart()
+
+        assert pump(app, lambda: not app.restarting)
+
+        first = app.runner.snapshot()["start_ns"]
+
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline:
+            app.root.update()
+            time.sleep(0.01)
+
+        assert app.runner.running() is True
+        assert app.runner.snapshot()["start_ns"] == first, "a late handover restarted the new run"
 
     def test_restart_of_a_finished_run_just_starts(self, app):
         make_quick(app, "Abra")
         app.active.set("Abra")
         app.on_start()
-        wait_for(app, "finished")
+        wait_for(app.runner.events, "finished")
         app.runner.join(timeout = 5.0)
 
         app.on_start()
 
-        assert wait_for(app, "started")["name"] == "Abra"
+        assert wait_for(app.runner.events, "started")["name"] == "Abra"
 
 
 class TestLiveAdjustments:
-    def running_app(self, app, offsets = (20_000,)):
-        app.timers["Abra"]["offsets"] = list(offsets)
-        app.active.set("Abra")
-        app.on_start()
-        wait_for(app, "started")
-        return app
-
     def test_buttons_exist_for_every_shift(self, app):
         assert list(app.buttons_shift) == ["add", "subtract", "add_all", "subtract_all"]
 
@@ -819,14 +856,14 @@ class TestLiveAdjustments:
         assert "disabled" in app.button_frame.state()
 
     def test_shift_buttons_are_enabled_while_running(self, app):
-        self.running_app(app)
+        start_run(app)
         app.refresh_controls()
 
         assert all("disabled" not in button.state() for button in app.buttons_shift.values())
         assert "disabled" not in app.button_frame.state()
 
     def test_add_shifts_the_next_offset(self, app):
-        self.running_app(app)
+        start_run(app)
 
         app.on_shift("add")
 
@@ -834,14 +871,14 @@ class TestLiveAdjustments:
         assert "20000 >>> 20017" in app.label_status.cget("text")
 
     def test_subtract_shifts_the_other_way(self, app):
-        self.running_app(app)
+        start_run(app)
 
         app.on_shift("subtract")
 
         assert app.runner.snapshot()["pending"][0][1] == pytest.approx(20_000 - src.ui.FRAME_MS)
 
     def test_add_all_shifts_every_offset(self, app):
-        self.running_app(app, offsets = (20_000, 30_000))
+        start_run(app, offsets = (20_000, 30_000))
 
         before = app.runner.snapshot()["pending"]
         app.on_shift("add_all")
@@ -851,7 +888,7 @@ class TestLiveAdjustments:
         assert "All Offsets" in app.label_status.cget("text")
 
     def test_shift_reports_a_refusal(self, app):
-        self.running_app(app, offsets = (1100,))
+        start_run(app, offsets = (1100,))
 
         app.on_shift("add")
 
@@ -859,7 +896,7 @@ class TestLiveAdjustments:
         assert str(app.label_status.cget("foreground")) == "red"
 
     def test_pending_display_tracks_a_shift(self, app):
-        self.running_app(app)
+        start_run(app)
 
         app.on_shift("add")
         app.refresh_run()
@@ -867,7 +904,7 @@ class TestLiveAdjustments:
         assert "20017" in app.label_pending.cget("text")
 
     def test_pending_display_marks_the_next_offset(self, app):
-        self.running_app(app, offsets = (20_000, 30_000))
+        start_run(app, offsets = (20_000, 30_000))
         app.refresh_run()
 
         assert app.label_pending.cget("text").startswith("> 20000")
@@ -879,15 +916,8 @@ class TestLiveAdjustments:
 
 
 class TestVariableFrameField:
-    def running_app(self, app, offsets = (20_000,)):
-        app.timers["Abra"]["offsets"] = list(offsets)
-        app.active.set("Abra")
-        app.on_start()
-        wait_for(app, "started")
-        return app
-
     def test_submitting_appends_an_offset(self, app):
-        self.running_app(app)
+        start_run(app)
 
         app.variable_frame.set("300")
         app.on_submit_frame()
@@ -896,7 +926,7 @@ class TestVariableFrameField:
         assert "appended" in app.label_status.cget("text")
 
     def test_the_field_clears_after_a_submit(self, app):
-        self.running_app(app)
+        start_run(app)
 
         app.variable_frame.set("300")
         app.on_submit_frame()
@@ -904,14 +934,14 @@ class TestVariableFrameField:
         assert app.variable_frame.get() == ""
 
     def test_an_empty_field_is_reported(self, app):
-        self.running_app(app)
+        start_run(app)
 
         app.on_submit_frame()
 
         assert "Enter a variable frame" in app.label_status.cget("text")
 
     def test_a_non_numeric_field_is_reported(self, app):
-        self.running_app(app)
+        start_run(app)
 
         app.variable_frame.set("oops")
         app.on_submit_frame()
@@ -920,7 +950,7 @@ class TestVariableFrameField:
         assert app.variable_frame.get() == "oops", "a bad value should stay for editing"
 
     def test_negative_frames_are_accepted(self, app):
-        self.running_app(app)
+        start_run(app)
 
         app.variable_frame.set("-5")
         app.on_submit_frame()
@@ -934,7 +964,7 @@ class TestVariableFrameField:
         assert "No timer is running" in app.label_status.cget("text")
 
     def test_keybind_submits(self, app):
-        self.running_app(app)
+        start_run(app)
 
         app.variable_frame.set("300")
         press(app, bind_for("variable_frame"))
@@ -947,16 +977,9 @@ class TestVariableFrameField:
 
 
 class TestShiftHotkeys:
-    def running_app(self, app, offsets = (20_000,)):
-        app.timers["Abra"]["offsets"] = list(offsets)
-        app.active.set("Abra")
-        app.on_start()
-        wait_for(app, "started")
-        return app
-
     @pytest.mark.parametrize("action, sign", [("add", 1), ("subtract", -1)])
     def test_shift_keybinds_move_the_next_offset(self, app, action, sign):
-        self.running_app(app)
+        start_run(app)
 
         press(app, bind_for(action))
 
@@ -964,7 +987,7 @@ class TestShiftHotkeys:
 
     @pytest.mark.parametrize("action, sign", [("add_all", 1), ("subtract_all", -1)])
     def test_shift_all_keybinds_move_everything(self, app, action, sign):
-        self.running_app(app, offsets = (20_000, 30_000))
+        start_run(app, offsets = (20_000, 30_000))
 
         press(app, bind_for(action))
 
@@ -977,7 +1000,7 @@ class TestShiftHotkeys:
         app.on_capture("add")
         press(app, "k")
 
-        self.running_app(app)
+        start_run(app)
         press(app, "k")
 
         assert app.runner.snapshot()["pending"][0][1] == pytest.approx(20_000 + src.ui.FRAME_MS)

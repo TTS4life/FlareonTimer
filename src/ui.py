@@ -14,20 +14,24 @@ import tkinter
 from tkinter import messagebox, ttk
 
 from src.config    import PATH_CONFIG, PATH_TIMERS, config
-from src.config    import timers as timers_in_memory
 from src.constants import FRAME_MS, MS_TO_NS
-from src.offsets   import compact, duplicates, lead_in, parse, parse_all, parse_beeps, parse_interval, warnings
-from src.offsets   import save as save_timers
+from src.jsonfile  import compact, save
+from src.offsets   import duplicates, lead_in, parse, parse_all, parse_beeps, parse_interval, warnings
 from src.runner    import Runner
 from src.settings  import ACTIONS, binding, conflict, describe, usable
-from src.settings  import save as save_config
 
 COLOUR_BAD     = "#ffd6d6"
 COLOUR_NEUTRAL = "white"
 
 TICK_MS = 50
 
-SHIFTS = ["add", "subtract", "add_all", "subtract_all"]
+# action -> button label, frame direction, whether it moves every offset
+SHIFTS = {
+    "add":          ("+1 frame", +1, False),
+    "subtract":     ("-1 frame", -1, False),
+    "add_all":      ("+1 all",   +1, True),
+    "subtract_all": ("-1 all",   -1, True),
+}
 
 def format_value(value):
     return str(compact(value))
@@ -43,10 +47,12 @@ def format_elapsed(elapsed_ms):
     return f"{sign}{minutes:02d}:{seconds:02d}.{remainder:03d}"
 
 
-def publish(timers):
-    """Share saved edits with the engine, which reads src.config.timers."""
-    timers_in_memory.clear()
-    timers_in_memory.update(copy.deepcopy(timers))
+def recolour(entry, ok):
+    """Tk schedules a redraw even when the colour is unchanged, and validation
+    runs across every row on every keystroke, so only touch what moved."""
+    wanted = COLOUR_NEUTRAL if ok else COLOUR_BAD
+
+    if str(entry.cget("background")) != wanted: entry.configure(background = wanted)
 
 
 class ScrollFrame(ttk.Frame):
@@ -71,10 +77,27 @@ class ScrollFrame(ttk.Frame):
 
         self.body.bind("<Configure>", lambda event: canvas.configure(scrollregion = canvas.bbox("all")))
         canvas.bind("<Configure>",    lambda event: canvas.itemconfigure(self.window, width = event.width))
-        canvas.bind("<Enter>",        lambda event: canvas.bind_all("<MouseWheel>", self.on_wheel))
-        canvas.bind("<Leave>",        lambda event: canvas.unbind_all("<MouseWheel>"))
+
+        # Bound once, for the life of the widget. Re-binding on <Enter> and
+        # dropping it on <Leave> looks tidier but leaks: unbind_all only blanks
+        # the script, it never deletes the Tcl command bind_all registered, so
+        # every pointer crossing adds one more that is never freed.
+        canvas.bind_all("<MouseWheel>", self.on_wheel, add = "+")
+
+    def owns(self, event):
+        """Whether the pointer is over this scroller - both share the global
+        wheel binding, so each has to decide if the event is its own."""
+        if not self.canvas.winfo_ismapped(): return False
+
+        left = self.canvas.winfo_rootx()
+        top  = self.canvas.winfo_rooty()
+
+        return (left <= event.x_root < left + self.canvas.winfo_width() and
+                top  <= event.y_root < top  + self.canvas.winfo_height())
 
     def on_wheel(self, event):
+        if not self.owns(event): return
+
         self.canvas.yview_scroll(-int(event.delta / 120), "units")
 
     def clear(self):
@@ -129,8 +152,8 @@ class TimerRow:
         self.entry_beeps.configure(state    = "normal" if enabled else "disabled")
 
     def mark(self, interval_ok, beeps_ok):
-        self.entry_interval.configure(background = COLOUR_NEUTRAL if interval_ok else COLOUR_BAD)
-        self.entry_beeps.configure(background    = COLOUR_NEUTRAL if beeps_ok    else COLOUR_BAD)
+        recolour(self.entry_interval, interval_ok)
+        recolour(self.entry_beeps,    beeps_ok)
 
 
 class OffsetRow:
@@ -160,7 +183,7 @@ class OffsetRow:
         self.label.configure(text = f"{index}.")
 
     def mark(self, ok):
-        self.entry.configure(background = COLOUR_NEUTRAL if ok else COLOUR_BAD)
+        recolour(self.entry, ok)
 
     def focus(self):
         self.entry.focus_set()
@@ -174,8 +197,7 @@ class KeybindRow:
     """One keybind on the settings tab."""
 
     def __init__(self, parent, index, action, label, on_capture):
-        self.action = action
-        self.label  = label
+        self.label = label
 
         tkinter.Label(parent, text = label, anchor = "w").grid(row = index, column = 0, sticky = "w", padx = (4, 20), pady = 5)
 
@@ -204,6 +226,17 @@ class Application(ttk.Frame):
         self.capturing   = None
         self.after_id    = None
         self.restarting  = False
+
+        self.shown_title    = None
+        self.shown_revision = None
+
+        self.handlers = {
+            "start_restart":  self.on_start,
+            "previous":       self.on_previous,
+            "next":           self.on_next,
+            "variable_frame": self.on_submit_frame,
+            **{action: (lambda a = action: self.on_shift(a)) for action in SHIFTS},
+        }
 
         self.active = tkinter.StringVar(value = next(iter(self.timers), ""))
 
@@ -287,16 +320,9 @@ class Application(ttk.Frame):
         controls = ttk.Frame(screen)
         controls.grid(row = 5, column = 0, sticky = "ew", pady = (8, 0))
 
-        shifts = [
-            ("add",          "+1 frame"),
-            ("subtract",     "-1 frame"),
-            ("add_all",      "+1 all"),
-            ("subtract_all", "-1 all"),
-        ]
-
         self.buttons_shift = {}
 
-        for action, text in shifts:
+        for action, (text, _, _) in SHIFTS.items():
             button = ttk.Button(controls, text = text, width = 9, command = lambda a = action: self.on_shift(a))
             button.pack(side = "left", padx = (0, 4))
 
@@ -427,7 +453,7 @@ class Application(ttk.Frame):
         row.frame.pack(fill = "x", pady = 1)
 
         self.offset_rows.append(row)
-        self.renumber()
+        row.renumber(len(self.offset_rows))   # only removal disturbs the others
 
         return row
 
@@ -479,8 +505,10 @@ class Application(ttk.Frame):
 
     def refresh_run(self):
         if not self.runner.running():
-            self.label_run.configure(text = "")
-            self.label_pending.configure(text = "")
+            if self.shown_revision is not None:
+                self.label_run.configure(text = "")
+                self.label_pending.configure(text = "")
+                self.shown_revision = None
             return
 
         state = self.runner.snapshot()
@@ -497,19 +525,28 @@ class Application(ttk.Frame):
             text += f"   next {round(target_ms)} ms   first beep in {(beep_ms - elapsed_ms) / 1_000:+.2f} s"
 
         self.label_run.configure(text = text)
-        self.label_pending.configure(text = self.format_pending(pending))
+
+        # The pending list only changes on a beep or a shift, but the label
+        # wraps its text, so re-setting it 20x a second costs ~70us of Tk
+        # relayout on the thread the run is sharing. The runner's revision
+        # counter says when it actually moved.
+        if state["revision"] != self.shown_revision:
+            self.label_pending.configure(text = self.format_pending(pending))
+            self.shown_revision = state["revision"]
 
     def format_pending(self, pending):
         """Whole milliseconds: a shifted offset is a fraction of a frame off a
         round number, and src/main.py reports these rounded too."""
         if not pending: return "none left"
 
-        targets = [str(round(target)) for _, target in pending]
+        return "> " + "   ".join(str(round(target)) for _, target in pending)
 
-        return "   ".join([f"> {targets[0]}"] + targets[1:])
+    def busy(self):
+        """A run is in progress, including the gap while a restart hands over."""
+        return self.runner.running() or self.restarting
 
     def refresh_controls(self):
-        running = self.runner.running() or self.restarting
+        running = self.busy()
         state   = ["!disabled"] if running else ["disabled"]
 
         self.button_start.configure(text = "Restart timer" if running else "Start timer")
@@ -533,30 +570,33 @@ class Application(ttk.Frame):
 
         return self.commit_offsets()
 
-    def commit_timers(self):
-        errors = []
-        values = {}
+    def parse_rows(self):
+        """One pass over the timer list feeding both commit and validate, so
+        the boxes that turn red are exactly the ones that block a save."""
+        parsed = []
 
         for row in self.timer_rows:
             interval_text, beeps_text = row.texts()
 
-            try: interval = parse_interval(interval_text)
-            except ValueError as error:
-                errors.append(f"{row.name} interval {error}")
-                interval = None
+            try:                        interval, interval_error = parse_interval(interval_text), None
+            except ValueError as error: interval, interval_error = None, f"{row.name} interval {error}"
 
-            try: beeps = parse_beeps(beeps_text)
-            except ValueError as error:
-                errors.append(f"{row.name} beeps {error}")
-                beeps = None
+            try:                        beeps, beeps_error = parse_beeps(beeps_text), None
+            except ValueError as error: beeps, beeps_error = None, f"{row.name} beeps {error}"
 
-            if interval is not None and beeps is not None: values[row.name] = (interval, beeps)
+            parsed.append((row, interval, beeps, interval_error, beeps_error))
+
+        return parsed
+
+    def commit_timers(self):
+        parsed = self.parse_rows()
+        errors = [error for _, _, _, *messages in parsed for error in messages if error]
 
         if errors: return errors
 
-        for name, (interval, beeps) in values.items():
-            self.timers[name]["interval"]     = interval
-            self.timers[name]["number_beeps"] = beeps
+        for row, interval, beeps, _, _ in parsed:
+            self.timers[row.name]["interval"]     = interval
+            self.timers[row.name]["number_beeps"] = beeps
 
         return []
 
@@ -606,26 +646,26 @@ class Application(ttk.Frame):
 
         if in_entry and event.keysym not in ("Return", "Escape"): return
 
-        keybinds = config["keybinds"]
+        # modifiers and function keys carry no character, and binding() returns
+        # "" for an action config.json does not define - without this guard the
+        # two match and a bare Shift fires whichever action is unbound
+        if not event.char: return
 
-        if   event.char == binding(keybinds, "start_restart"):  self.on_start()
-        elif event.char == binding(keybinds, "previous"):       self.on_previous()
-        elif event.char == binding(keybinds, "next"):           self.on_next()
-        elif event.char == binding(keybinds, "variable_frame"): self.on_submit_frame()
-        elif event.char in [binding(keybinds, action) for action in SHIFTS]:
-            for action in SHIFTS:
-                if event.char == binding(keybinds, action):
-                    self.on_shift(action)
-                    break
+        for action, handler in self.handlers.items():
+            if event.char == binding(config["keybinds"], action):
+                handler()
+                return
+
+    def report_result(self, ok, message):
+        """Live adjustments answer (ok, message): refusals are errors, the rest
+        are notes."""
+        self.report([] if ok else [message], notes = [message] if ok else [])
+        self.refresh_run()
 
     def on_shift(self, action):
-        delta = FRAME_MS if action in ("add", "add_all") else -FRAME_MS
-        every = action in ("add_all", "subtract_all")
+        _, direction, every = SHIFTS[action]
 
-        ok, message = self.runner.shift_pending(delta, every)
-
-        self.report([] if ok else [message], notes = [message] if ok else ())
-        self.refresh_run()
+        self.report_result(*self.runner.shift_pending(direction * FRAME_MS, every))
 
     def on_submit_frame(self, event = None):
         text = self.variable_frame.get().strip()
@@ -641,11 +681,9 @@ class Application(ttk.Frame):
 
         ok, message = self.runner.submit_variable_frame(frame)
 
-        self.report([] if ok else [message], notes = [message] if ok else ())
-
         if ok: self.variable_frame.set("")
 
-        self.refresh_run()
+        self.report_result(ok, message)
 
         return "break"
 
@@ -699,7 +737,7 @@ class Application(ttk.Frame):
         self.active.set(names[(index + delta) % len(names)])
 
     def on_start(self):
-        if self.runner.running() or self.restarting:
+        if self.busy():
             self.on_restart()
             return
 
@@ -730,6 +768,10 @@ class Application(ttk.Frame):
         so the handover waits on the Tk event loop rather than joining here -
         joining would freeze the window for the length of a beep sequence.
         """
+        # Defensive only - resume_after_stop's own check already makes a
+        # stacked handover harmless. This just avoids the extra polling chain.
+        if self.restarting: return
+
         self.restarting = True
 
         self.report([], notes = ["Restarting..."])
@@ -738,6 +780,10 @@ class Application(ttk.Frame):
 
     def resume_after_stop(self):
         if not self.winfo_exists(): return
+
+        # Stop cancels a handover by clearing the flag. Without this the queued
+        # callback starts a fresh run anyway and Stop is silently ignored.
+        if not self.restarting: return
 
         if self.runner.running():
             self.after(10, self.resume_after_stop)
@@ -807,17 +853,23 @@ class Application(ttk.Frame):
             self.report(errors)
             return False
 
-        save_timers(self.timers, PATH_TIMERS)
-        publish(self.timers)
-        self.snapshot = copy.deepcopy(self.timers)
+        written = []
 
-        save_config(config, PATH_CONFIG)
-        self.config_snapshot = copy.deepcopy(config)
+        if self.timers != self.snapshot:
+            save(self.timers, PATH_TIMERS)
+            self.snapshot = copy.deepcopy(self.timers)
+            written.append("timers.json")
+
+        if config != self.config_snapshot:
+            save(config, PATH_CONFIG)
+            self.config_snapshot = copy.deepcopy(config)
+            written.append("config.json")
 
         if self.editing is not None: self.refresh_context()
-        else:                        [row.set_count(len(self.timers[row.name]["offsets"])) for row in self.timer_rows]
+        else:
+            for row in self.timer_rows: row.set_count(len(self.timers[row.name]["offsets"]))
 
-        self.report([], saved = True)
+        self.report([], saved = written)
         self.update_title()
 
         return True
@@ -846,19 +898,8 @@ class Application(ttk.Frame):
         if not self.runner.running() and self.capturing is None: self.report([], notes = notes)
 
     def validate_timers(self):
-        for row in self.timer_rows:
-            interval_text, beeps_text = row.texts()
-
-            interval_ok = True
-            beeps_ok    = True
-
-            try: parse_interval(interval_text)
-            except ValueError: interval_ok = False
-
-            try: parse_beeps(beeps_text)
-            except ValueError: beeps_ok = False
-
-            row.mark(interval_ok, beeps_ok)
+        for row, _, _, interval_error, beeps_error in self.parse_rows():
+            row.mark(interval_error is None, beeps_error is None)
 
         return []
 
@@ -883,19 +924,23 @@ class Application(ttk.Frame):
         return warnings(offsets, configuration["interval"], configuration["number_beeps"])
 
     def update_title(self):
-        where  = f" - {self.editing}" if self.editing else ""
+        where  = f" - {self.editing}" if self.editing is not None else ""
         marker = " *" if self.dirty() else ""
+        title  = f"FlareonTimer{where}{marker}"
 
-        self.root.title(f"FlareonTimer{where}{marker}")
+        if title == self.shown_title: return   # issued on every keystroke
 
-    def report(self, errors, notes = (), saved = False):
+        self.root.title(title)
+        self.shown_title = title
+
+    def report(self, errors, notes = (), saved = ()):
         if errors:
             self.label_status.configure(text = "\n".join(errors), foreground = "red")
             return
 
         messages = []
 
-        if saved: messages.append("Saved to timers.json and config.json.")
+        if saved: messages.append(f"Saved to {' and '.join(saved)}.")
         messages.extend(notes)
 
         self.label_status.configure(
