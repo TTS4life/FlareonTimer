@@ -9,9 +9,14 @@ INDENT = " " * 4
 
 # the keybinds the window exposes, in the order the settings tab shows them
 ACTIONS = [
-    ("start_restart", "Start timer"),
-    ("previous",      "Previous timer"),
-    ("next",          "Next timer"),
+    ("start_restart",  "Start timer"),
+    ("previous",       "Previous timer"),
+    ("next",           "Next timer"),
+    ("add",            "Offset +1 frame"),
+    ("subtract",       "Offset -1 frame"),
+    ("add_all",        "All offsets +1 frame"),
+    ("subtract_all",   "All offsets -1 frame"),
+    ("variable_frame", "Submit variable frame"),
 ]
 
 # config.json shipped without a "previous" bind, so the window supplies one

@@ -7,6 +7,7 @@ up. src.runner claims the sound device only once a run begins.
 
 import copy
 import json
+import threading
 import time
 import tkinter
 
@@ -14,7 +15,7 @@ from tkinter import messagebox, ttk
 
 from src.config    import PATH_CONFIG, PATH_TIMERS, config
 from src.config    import timers as timers_in_memory
-from src.constants import MS_TO_NS
+from src.constants import FRAME_MS, MS_TO_NS
 from src.offsets   import compact, duplicates, lead_in, parse, parse_all, parse_beeps, parse_interval, warnings
 from src.offsets   import save as save_timers
 from src.runner    import Runner
@@ -25,6 +26,8 @@ COLOUR_BAD     = "#ffd6d6"
 COLOUR_NEUTRAL = "white"
 
 TICK_MS = 50
+
+SHIFTS = ["add", "subtract", "add_all", "subtract_all"]
 
 def format_value(value):
     return str(compact(value))
@@ -115,10 +118,15 @@ class TimerRow:
         self.label_offsets.configure(text = f"{count} offsets")
 
     def set_enabled(self, enabled):
+        """Disabled during a run: the values cannot affect a run already going,
+        and it keeps focus out of these boxes so the shift keybinds work."""
         state = ["!disabled"] if enabled else ["disabled"]
 
         self.radio.state(state)
         self.button.state(state)
+
+        self.entry_interval.configure(state = "normal" if enabled else "disabled")
+        self.entry_beeps.configure(state    = "normal" if enabled else "disabled")
 
     def mark(self, interval_ok, beeps_ok):
         self.entry_interval.configure(background = COLOUR_NEUTRAL if interval_ok else COLOUR_BAD)
@@ -222,8 +230,23 @@ class Application(ttk.Frame):
         root.bind("<Control-s>", lambda event: self.on_save())
         root.bind("<Key>", self.on_key)
 
+        self.warm_audio()
         self.show_timers()
         self.tick()
+
+    def warm_audio(self):
+        """Open the sound device up front, on a background thread.
+
+        src.audio opens its OutputStream at import, and the runner takes its
+        t=0 after that import. Doing it on the first Start would put the device
+        opening between the click and the clock starting, which matters when
+        the press is synced to something on screen.
+        """
+        def load():
+            try:    import src.audio
+            except Exception: pass   # reported properly when a run is started
+
+        threading.Thread(target = load, daemon = True).start()
 
     # --- screens -----------------------------------------------------------
 
@@ -246,7 +269,45 @@ class Application(ttk.Frame):
         self.scroll_timers = ScrollFrame(screen)
         self.scroll_timers.grid(row = 2, column = 0, sticky = "nsew")
 
+        ttk.Label(screen, text = "Pending offsets", foreground = "gray").grid(row = 3, column = 0, sticky = "w", pady = (10, 0))
+
+        self.label_pending = ttk.Label(screen, text = "", font = ("Consolas", 10), wraplength = 700, justify = "left")
+        self.label_pending.grid(row = 4, column = 0, sticky = "w")
+
+        self.build_adjustments(screen)
+
         self.screen_timers = screen
+
+    def build_adjustments(self, screen):
+        """The live shift buttons and variable frame entry, under the offsets."""
+        controls = ttk.Frame(screen)
+        controls.grid(row = 5, column = 0, sticky = "ew", pady = (8, 0))
+
+        shifts = [
+            ("add",          "+1 frame"),
+            ("subtract",     "-1 frame"),
+            ("add_all",      "+1 all"),
+            ("subtract_all", "-1 all"),
+        ]
+
+        self.buttons_shift = {}
+
+        for action, text in shifts:
+            button = ttk.Button(controls, text = text, width = 9, command = lambda a = action: self.on_shift(a))
+            button.pack(side = "left", padx = (0, 4))
+
+            self.buttons_shift[action] = button
+
+        ttk.Label(controls, text = "Variable frame").pack(side = "left", padx = (16, 6))
+
+        self.variable_frame = tkinter.StringVar()
+
+        self.entry_frame = tkinter.Entry(controls, textvariable = self.variable_frame, width = 10, justify = "right")
+        self.entry_frame.pack(side = "left")
+        self.entry_frame.bind("<Return>", self.on_submit_frame)
+
+        self.button_frame = ttk.Button(controls, text = "Submit", width = 9, command = self.on_submit_frame)
+        self.button_frame.pack(side = "left", padx = 6)
 
     def build_offsets_screen(self):
         screen = ttk.Frame(self.tab_timers)
@@ -396,6 +457,13 @@ class Application(ttk.Frame):
                     f"     {event['remaining']} left"
                 ])
 
+            elif kind == "notice":
+                self.report([], notes = [event["message"]])
+
+            elif kind == "failed":
+                self.report([f"{event['name']} could not run - {event['message']}"])
+                self.refresh_controls()
+
             elif kind in ("finished", "stopped"):
                 verb = "finished" if kind == "finished" else "stopped"
                 self.report([], notes = [f"{event['name']} {verb}."])
@@ -404,6 +472,7 @@ class Application(ttk.Frame):
     def refresh_run(self):
         if not self.runner.running():
             self.label_run.configure(text = "")
+            self.label_pending.configure(text = "")
             return
 
         state = self.runner.snapshot()
@@ -413,16 +482,33 @@ class Application(ttk.Frame):
         elapsed_ms = (time.perf_counter_ns() - state["start_ns"]) / MS_TO_NS
         text       = f"{state['name']}   {format_elapsed(elapsed_ms)}"
 
-        if state["pending"]:
-            beep_ms, target_ms = state["pending"][0]
-            text += f"   next {format_value(target_ms)} ms   first beep in {(beep_ms - elapsed_ms) / 1_000:+.2f} s"
+        pending = state["pending"]
+
+        if pending:
+            beep_ms, target_ms = pending[0]
+            text += f"   next {round(target_ms)} ms   first beep in {(beep_ms - elapsed_ms) / 1_000:+.2f} s"
 
         self.label_run.configure(text = text)
+        self.label_pending.configure(text = self.format_pending(pending))
+
+    def format_pending(self, pending):
+        """Whole milliseconds: a shifted offset is a fraction of a frame off a
+        round number, and src/main.py reports these rounded too."""
+        if not pending: return "none left"
+
+        targets = [str(round(target)) for _, target in pending]
+
+        return "   ".join([f"> {targets[0]}"] + targets[1:])
 
     def refresh_controls(self):
         running = self.runner.running()
+        state   = ["!disabled"] if running else ["disabled"]
 
         self.button_start.configure(text = "Stop timer" if running else "Start timer")
+
+        for button in self.buttons_shift.values(): button.state(state)
+
+        self.button_frame.state(state)
 
         for row in self.timer_rows: row.set_enabled(not running)
 
@@ -513,9 +599,46 @@ class Application(ttk.Frame):
 
         keybinds = config["keybinds"]
 
-        if   event.char == binding(keybinds, "start_restart"): self.on_start()
-        elif event.char == binding(keybinds, "previous"):      self.on_previous()
-        elif event.char == binding(keybinds, "next"):          self.on_next()
+        if   event.char == binding(keybinds, "start_restart"):  self.on_start()
+        elif event.char == binding(keybinds, "previous"):       self.on_previous()
+        elif event.char == binding(keybinds, "next"):           self.on_next()
+        elif event.char == binding(keybinds, "variable_frame"): self.on_submit_frame()
+        elif event.char in [binding(keybinds, action) for action in SHIFTS]:
+            for action in SHIFTS:
+                if event.char == binding(keybinds, action):
+                    self.on_shift(action)
+                    break
+
+    def on_shift(self, action):
+        delta = FRAME_MS if action in ("add", "add_all") else -FRAME_MS
+        every = action in ("add_all", "subtract_all")
+
+        ok, message = self.runner.shift_pending(delta, every)
+
+        self.report([] if ok else [message], notes = [message] if ok else ())
+        self.refresh_run()
+
+    def on_submit_frame(self, event = None):
+        text = self.variable_frame.get().strip()
+
+        if not text:
+            self.report(["Enter a variable frame first."])
+            return "break"
+
+        try: frame = float(text)
+        except ValueError:
+            self.report([f"{text!r} is not a number."])
+            return "break"
+
+        ok, message = self.runner.submit_variable_frame(frame)
+
+        self.report([] if ok else [message], notes = [message] if ok else ())
+
+        if ok: self.variable_frame.set("")
+
+        self.refresh_run()
+
+        return "break"
 
     def capture_key(self, event):
         action = self.capturing

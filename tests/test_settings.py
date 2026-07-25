@@ -71,11 +71,21 @@ class TestConflict:
 
 
 class TestActions:
-    def test_exposes_the_three_window_binds(self):
-        assert [action for action, _ in ACTIONS] == ["start_restart", "previous", "next"]
+    def test_exposes_every_window_bind(self):
+        assert [action for action, _ in ACTIONS] == [
+            "start_restart",
+            "previous",
+            "next",
+            "add",
+            "subtract",
+            "add_all",
+            "subtract_all",
+            "variable_frame",
+        ]
 
-    def test_labels_are_set(self):
-        assert [label for _, label in ACTIONS] == ["Start timer", "Previous timer", "Next timer"]
+    def test_every_action_has_a_label(self):
+        assert all(label for _, label in ACTIONS)
+        assert len({label for _, label in ACTIONS}) == len(ACTIONS), "labels must be distinct"
 
     def test_every_action_resolves_against_the_shipped_config(self):
         for action, _ in ACTIONS:

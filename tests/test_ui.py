@@ -664,9 +664,195 @@ class TestHotkeys:
         assert app.active.get() == "Mudkip"
 
 
+class TestLiveAdjustments:
+    def running_app(self, app, offsets = (20_000,)):
+        app.timers["Abra"]["offsets"] = list(offsets)
+        app.active.set("Abra")
+        app.on_start()
+        wait_for(app, "started")
+        return app
+
+    def test_buttons_exist_for_every_shift(self, app):
+        assert list(app.buttons_shift) == ["add", "subtract", "add_all", "subtract_all"]
+
+    def test_shift_buttons_are_disabled_when_idle(self, app):
+        app.refresh_controls()
+
+        assert all("disabled" in button.state() for button in app.buttons_shift.values())
+        assert "disabled" in app.button_frame.state()
+
+    def test_shift_buttons_are_enabled_while_running(self, app):
+        self.running_app(app)
+        app.refresh_controls()
+
+        assert all("disabled" not in button.state() for button in app.buttons_shift.values())
+        assert "disabled" not in app.button_frame.state()
+
+    def test_add_shifts_the_next_offset(self, app):
+        self.running_app(app)
+
+        app.on_shift("add")
+
+        assert app.runner.snapshot()["pending"][0][1] == pytest.approx(20_000 + src.ui.FRAME_MS)
+        assert "20000 >>> 20017" in app.label_status.cget("text")
+
+    def test_subtract_shifts_the_other_way(self, app):
+        self.running_app(app)
+
+        app.on_shift("subtract")
+
+        assert app.runner.snapshot()["pending"][0][1] == pytest.approx(20_000 - src.ui.FRAME_MS)
+
+    def test_add_all_shifts_every_offset(self, app):
+        self.running_app(app, offsets = (20_000, 30_000))
+
+        before = app.runner.snapshot()["pending"]
+        app.on_shift("add_all")
+        after = app.runner.snapshot()["pending"]
+
+        assert all(new[1] - old[1] == pytest.approx(src.ui.FRAME_MS) for old, new in zip(before, after))
+        assert "All Offsets" in app.label_status.cget("text")
+
+    def test_shift_reports_a_refusal(self, app):
+        self.running_app(app, offsets = (1100,))
+
+        app.on_shift("add")
+
+        assert "Didn't shift any offset!" in app.label_status.cget("text")
+        assert str(app.label_status.cget("foreground")) == "red"
+
+    def test_pending_display_tracks_a_shift(self, app):
+        self.running_app(app)
+
+        app.on_shift("add")
+        app.refresh_run()
+
+        assert "20017" in app.label_pending.cget("text")
+
+    def test_pending_display_marks_the_next_offset(self, app):
+        self.running_app(app, offsets = (20_000, 30_000))
+        app.refresh_run()
+
+        assert app.label_pending.cget("text").startswith("> 20000")
+
+    def test_pending_display_is_blank_when_idle(self, app):
+        app.refresh_run()
+
+        assert app.label_pending.cget("text") == ""
+
+
+class TestVariableFrameField:
+    def running_app(self, app, offsets = (20_000,)):
+        app.timers["Abra"]["offsets"] = list(offsets)
+        app.active.set("Abra")
+        app.on_start()
+        wait_for(app, "started")
+        return app
+
+    def test_submitting_appends_an_offset(self, app):
+        self.running_app(app)
+
+        app.variable_frame.set("300")
+        app.on_submit_frame()
+
+        assert len(app.runner.snapshot()["pending"]) == 2
+        assert "appended" in app.label_status.cget("text")
+
+    def test_the_field_clears_after_a_submit(self, app):
+        self.running_app(app)
+
+        app.variable_frame.set("300")
+        app.on_submit_frame()
+
+        assert app.variable_frame.get() == ""
+
+    def test_an_empty_field_is_reported(self, app):
+        self.running_app(app)
+
+        app.on_submit_frame()
+
+        assert "Enter a variable frame" in app.label_status.cget("text")
+
+    def test_a_non_numeric_field_is_reported(self, app):
+        self.running_app(app)
+
+        app.variable_frame.set("oops")
+        app.on_submit_frame()
+
+        assert "not a number" in app.label_status.cget("text")
+        assert app.variable_frame.get() == "oops", "a bad value should stay for editing"
+
+    def test_negative_frames_are_accepted(self, app):
+        self.running_app(app)
+
+        app.variable_frame.set("-5")
+        app.on_submit_frame()
+
+        assert "not a number" not in app.label_status.cget("text")
+
+    def test_submitting_with_no_run_is_reported(self, app):
+        app.variable_frame.set("300")
+        app.on_submit_frame()
+
+        assert "No timer is running" in app.label_status.cget("text")
+
+    def test_keybind_submits(self, app):
+        self.running_app(app)
+
+        app.variable_frame.set("300")
+        press(app, bind_for("variable_frame"))
+
+        assert len(app.runner.snapshot()["pending"]) == 2
+
+    def test_return_in_the_field_does_not_also_start(self, app):
+        """The field's Return handler must stop the event reaching on_key."""
+        assert app.on_submit_frame() == "break"
+
+
+class TestShiftHotkeys:
+    def running_app(self, app, offsets = (20_000,)):
+        app.timers["Abra"]["offsets"] = list(offsets)
+        app.active.set("Abra")
+        app.on_start()
+        wait_for(app, "started")
+        return app
+
+    @pytest.mark.parametrize("action, sign", [("add", 1), ("subtract", -1)])
+    def test_shift_keybinds_move_the_next_offset(self, app, action, sign):
+        self.running_app(app)
+
+        press(app, bind_for(action))
+
+        assert app.runner.snapshot()["pending"][0][1] == pytest.approx(20_000 + sign * src.ui.FRAME_MS)
+
+    @pytest.mark.parametrize("action, sign", [("add_all", 1), ("subtract_all", -1)])
+    def test_shift_all_keybinds_move_everything(self, app, action, sign):
+        self.running_app(app, offsets = (20_000, 30_000))
+
+        press(app, bind_for(action))
+
+        pending = app.runner.snapshot()["pending"]
+
+        assert pending[0][1] == pytest.approx(20_000 + sign * src.ui.FRAME_MS)
+        assert pending[1][1] == pytest.approx(30_000 + sign * src.ui.FRAME_MS)
+
+    def test_rebound_shift_key_works(self, app):
+        app.on_capture("add")
+        press(app, "k")
+
+        self.running_app(app)
+        press(app, "k")
+
+        assert app.runner.snapshot()["pending"][0][1] == pytest.approx(20_000 + src.ui.FRAME_MS)
+
+
 class TestSettingsTab:
     def test_has_a_row_per_action(self, app):
-        assert list(app.keybind_rows) == ["start_restart", "previous", "next"]
+        assert list(app.keybind_rows) == [action for action, _ in src.settings.ACTIONS]
+
+    def test_covers_every_live_adjustment(self, app):
+        for action in ["add", "subtract", "add_all", "subtract_all", "variable_frame"]:
+            assert action in app.keybind_rows
 
     def test_shows_the_configured_binds(self, app):
         assert app.keybind_rows["start_restart"].button.cget("text") == "Enter"

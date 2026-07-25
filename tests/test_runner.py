@@ -10,7 +10,8 @@ import time
 
 import pytest
 
-from src.runner import SPIN_MS, Runner
+from src.constants import FRAME_MS
+from src.runner    import SPIN_MS, Runner
 
 
 def timer(offsets, interval = 250, number_beeps = 5):
@@ -206,6 +207,186 @@ class TestSnapshot:
         collect(runner, "finished")
 
         assert configuration == original
+
+
+class TestShifting:
+    def test_shifts_the_next_offset_forward(self, runner):
+        runner.start("A", timer([5000]))
+        collect(runner, "started")
+
+        ok, message = runner.shift_pending(FRAME_MS, every = False)
+
+        assert ok is True
+        assert message == "Offset 5000 >>> 5017"
+        assert runner.snapshot()["pending"][0][1] == pytest.approx(5000 + FRAME_MS)
+
+    def test_shifts_the_next_offset_back(self, runner):
+        runner.start("A", timer([5000]))
+        collect(runner, "started")
+
+        ok, message = runner.shift_pending(-FRAME_MS, every = False)
+
+        assert ok is True
+        assert message == "Offset 5000 >>> 4983"
+
+    def test_shifting_moves_the_beep_with_the_target(self, runner):
+        runner.start("A", timer([5000]))
+        collect(runner, "started")
+
+        before = runner.snapshot()["pending"][0]
+        runner.shift_pending(FRAME_MS, every = False)
+        after = runner.snapshot()["pending"][0]
+
+        assert after[1] - after[0] == pytest.approx(before[1] - before[0])
+
+    def test_shift_all_moves_every_offset(self, runner):
+        runner.start("A", timer([5000, 7000, 9000]))
+        collect(runner, "started")
+
+        before = runner.snapshot()["pending"]
+        ok, message = runner.shift_pending(FRAME_MS, every = True)
+        after = runner.snapshot()["pending"]
+
+        assert ok is True
+        assert message == "All Offsets >>> +16.74"
+        assert all(new[1] - old[1] == pytest.approx(FRAME_MS) for old, new in zip(before, after))
+
+    def test_shift_all_moves_the_variable_frame_offset(self, runner):
+        """src/main.py keeps these in step so variable frames stay aligned."""
+        runner.start("A", timer([5000]))
+        collect(runner, "started")
+
+        runner.shift_pending(FRAME_MS, every = True)
+        assert runner.variable_frame_offset == 1
+
+        runner.shift_pending(-FRAME_MS, every = True)
+        assert runner.variable_frame_offset == 0
+
+    def test_shift_is_refused_inside_the_buffer(self, runner):
+        # first beep at 1100 - 1000 = 100 ms, already inside BUFFER_MS
+        runner.start("A", timer([1100]))
+        collect(runner, "started")
+
+        ok, message = runner.shift_pending(FRAME_MS, every = False)
+
+        assert ok is False
+        assert message == "Didn't shift any offset!"
+
+    def test_shift_is_refused_when_nothing_is_running(self, runner):
+        ok, message = runner.shift_pending(FRAME_MS, every = False)
+
+        assert ok is False
+        assert "No timer is running" in message
+
+    def test_a_shift_moves_when_the_beep_actually_fires(self, runner):
+        """The wait loop must pick up the new time, not the one it started on."""
+        runner.start("A", timer([2000], number_beeps = 1))
+        collect(runner, "started")
+
+        runner.shift_pending(500, every = False)
+
+        event = collect(runner, "beep")
+
+        assert event["planned"] == 2500
+        assert abs(event["delay"]) < 20, f"fired {event['delay']:.1f} ms off the shifted target"
+
+
+class TestVariableFrame:
+    def test_appends_an_offset(self, runner):
+        runner.start("A", timer([20_000]))
+        collect(runner, "started")
+
+        ok, message = runner.submit_variable_frame(300)
+
+        assert ok is True
+        assert "appended" in message
+        assert len(runner.snapshot()["pending"]) == 2
+
+    def test_uses_the_frame_offset_from_the_configuration(self, runner):
+        configuration = timer([20_000])
+        configuration["variable_frame_offset"] = -5
+
+        runner.start("A", configuration)
+        collect(runner, "started")
+
+        runner.submit_variable_frame(300)
+
+        expected = (300 - 5) * FRAME_MS
+        targets  = [target for _, target in runner.snapshot()["pending"]]
+
+        assert any(target == pytest.approx(expected) for target in targets)
+
+    def test_keeps_the_pending_list_sorted(self, runner):
+        runner.start("A", timer([20_000]))
+        collect(runner, "started")
+
+        runner.submit_variable_frame(300)
+
+        pending = runner.snapshot()["pending"]
+
+        assert pending == sorted(pending)
+
+    def test_refuses_a_frame_that_already_passed(self, runner):
+        runner.start("A", timer([20_000]))
+        collect(runner, "started")
+
+        ok, message = runner.submit_variable_frame(1)
+
+        assert ok is False
+        assert message == "Didn't append any offset!"
+
+    def test_waits_when_only_the_next_beep_blocks_it(self, runner):
+        """Mirrors the engine: a frame past the next beep queues, then lands."""
+        runner.start("A", timer([1100, 20_000]))
+        collect(runner, "started")
+
+        ok, message = runner.submit_variable_frame(300)
+
+        assert ok is True
+        assert "waiting" in message
+        assert runner.queued is not None
+
+        collect(runner, "notice", timeout = 15.0)
+
+        targets = [target for _, target in runner.snapshot()["pending"]]
+
+        assert any(target == pytest.approx(300 * FRAME_MS) for target in targets)
+
+    def test_refuses_when_nothing_is_running(self, runner):
+        ok, message = runner.submit_variable_frame(300)
+
+        assert ok is False
+        assert "No timer is running" in message
+
+
+class TestFailure:
+    def test_a_broken_run_reports_instead_of_dying_silently(self, runner, monkeypatch):
+        import src.audio
+
+        def explode(*args, **kwargs):
+            raise RuntimeError("no sound device")
+
+        monkeypatch.setattr(src.audio, "create_sequence_beeps", explode)
+
+        runner.start("A", timer([5000]))
+
+        event = collect(runner, "failed")
+
+        assert "no sound device" in event["message"]
+        assert event["name"] == "A"
+
+    def test_state_is_cleared_after_a_failure(self, runner, monkeypatch):
+        import src.audio
+
+        monkeypatch.setattr(src.audio, "create_sequence_beeps",
+                            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+
+        runner.start("A", timer([5000]))
+        collect(runner, "failed")
+        runner.join(timeout = 5.0)
+
+        assert runner.running() is False
+        assert runner.snapshot()["start_ns"] is None
 
 
 class TestStopResponsiveness:
