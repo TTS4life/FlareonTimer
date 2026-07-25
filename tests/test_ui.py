@@ -500,15 +500,17 @@ class TestStopping:
 
         assert wait_for(app, "stopped")["name"] == "Abra"
 
-    def test_start_button_stops_a_running_timer(self, app):
+    def test_the_stop_button_is_what_stops(self, app):
+        """Start doubles as Restart while running, so Stop has its own button."""
         app.timers["Abra"]["offsets"] = [60_000]
         app.active.set("Abra")
         app.on_start()
         wait_for(app, "started")
 
-        app.on_start()  # the button doubles as Stop
+        app.on_stop()
 
         assert wait_for(app, "stopped")["name"] == "Abra"
+        assert app.restarting is False
 
     def test_closing_stops_the_runner(self, app, closed):
         app.timers["Abra"]["offsets"] = [60_000]
@@ -523,14 +525,15 @@ class TestStopping:
 
 
 class TestRunControls:
-    def test_button_reads_stop_while_running(self, app):
+    def test_both_run_buttons_are_live_while_running(self, app):
         app.timers["Abra"]["offsets"] = [60_000]
         app.active.set("Abra")
         app.on_start()
         wait_for(app, "started")
         app.refresh_controls()
 
-        assert app.button_start.cget("text") == "Stop timer"
+        assert app.button_start.cget("text") == "Restart timer"
+        assert "disabled" not in app.button_stop.state()
 
     def test_rows_are_disabled_while_running(self, app):
         app.timers["Abra"]["offsets"] = [60_000]
@@ -662,6 +665,140 @@ class TestHotkeys:
         press(app, bind_for("next"))
 
         assert app.active.get() == "Mudkip"
+
+
+def pump(app, predicate, timeout = 10.0):
+    """Drives the Tk event loop until `predicate` holds.
+
+    The restart handover is scheduled with `after`, which never fires without
+    a running mainloop, so tests have to turn the loop over themselves.
+    """
+    deadline = time.monotonic() + timeout
+
+    while time.monotonic() < deadline:
+        app.root.update()
+
+        if predicate(): return True
+
+        time.sleep(0.01)
+
+    return False
+
+
+class TestRestart:
+    def running_app(self, app, offsets = (60_000,)):
+        app.timers["Abra"]["offsets"] = list(offsets)
+        app.active.set("Abra")
+        app.on_start()
+        wait_for(app, "started")
+        return app
+
+    def test_button_reads_restart_while_running(self, app):
+        self.running_app(app)
+        app.refresh_controls()
+
+        assert app.button_start.cget("text") == "Restart timer"
+
+    def test_button_reads_start_when_idle(self, app):
+        app.refresh_controls()
+
+        assert app.button_start.cget("text") == "Start timer"
+
+    def test_stop_button_is_disabled_when_idle(self, app):
+        app.refresh_controls()
+
+        assert "disabled" in app.button_stop.state()
+
+    def test_stop_button_is_enabled_while_running(self, app):
+        self.running_app(app)
+        app.refresh_controls()
+
+        assert "disabled" not in app.button_stop.state()
+
+    def test_restart_starts_a_fresh_run(self, app):
+        self.running_app(app)
+        first = app.runner.snapshot()["start_ns"]
+
+        app.on_start()   # the button doubles as Restart while running
+
+        assert pump(app, lambda: app.runner.running()
+                              and app.runner.snapshot()["start_ns"] not in (None, first))
+
+    def test_restart_resets_the_pending_offsets(self, app):
+        self.running_app(app, offsets = (60_000, 70_000))
+        app.on_shift("add")
+
+        assert app.runner.snapshot()["pending"][0][1] != 60_000
+
+        app.on_start()
+        pump(app, lambda: app.runner.running() and app.runner.snapshot()["pending"])
+
+        assert app.runner.snapshot()["pending"][0][1] == 60_000, "the shift should not survive a restart"
+
+    def test_restart_leaves_exactly_one_run_going(self, app):
+        self.running_app(app)
+
+        app.on_start()
+        pump(app, lambda: not app.restarting)
+
+        assert app.runner.running() is True
+        assert app.restarting is False
+
+    def test_the_keybind_restarts(self, app):
+        self.running_app(app)
+        first = app.runner.snapshot()["start_ns"]
+
+        press(app, bind_for("start_restart"), "Return")
+
+        assert pump(app, lambda: app.runner.running()
+                              and app.runner.snapshot()["start_ns"] not in (None, first))
+
+    def test_the_keybind_still_starts_when_idle(self, app):
+        make_quick(app, "Abra")
+        app.active.set("Abra")
+
+        press(app, bind_for("start_restart"), "Return")
+
+        assert wait_for(app, "started")["name"] == "Abra"
+
+    def test_controls_stay_live_across_the_handover(self, app):
+        """The window must not flick back to its idle state mid-restart."""
+        self.running_app(app)
+
+        app.on_restart()
+        app.refresh_controls()
+
+        assert app.restarting is True
+        assert app.button_start.cget("text") == "Restart timer"
+        assert "disabled" not in app.button_stop.state()
+
+    def test_stop_button_ends_the_run(self, app):
+        self.running_app(app)
+
+        app.on_stop()
+
+        assert wait_for(app, "stopped")["name"] == "Abra"
+        assert app.restarting is False
+
+    def test_stop_during_a_restart_cancels_it(self, app):
+        self.running_app(app)
+
+        app.on_restart()
+        app.on_stop()
+        pump(app, lambda: not app.runner.running(), timeout = 5.0)
+
+        assert app.restarting is False
+
+    def test_restart_of_a_finished_run_just_starts(self, app):
+        make_quick(app, "Abra")
+        app.active.set("Abra")
+        app.on_start()
+        wait_for(app, "finished")
+        app.runner.join(timeout = 5.0)
+
+        app.on_start()
+
+        assert wait_for(app, "started")["name"] == "Abra"
 
 
 class TestLiveAdjustments:

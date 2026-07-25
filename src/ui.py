@@ -203,6 +203,7 @@ class Application(ttk.Frame):
         self.editing     = None
         self.capturing   = None
         self.after_id    = None
+        self.restarting  = False
 
         self.active = tkinter.StringVar(value = next(iter(self.timers), ""))
 
@@ -262,6 +263,9 @@ class Application(ttk.Frame):
 
         self.button_start = ttk.Button(header, text = "Start timer", command = self.on_start)
         self.button_start.pack(side = "right")
+
+        self.button_stop = ttk.Button(header, text = "Stop", command = self.on_stop)
+        self.button_stop.pack(side = "right", padx = (0, 6))
 
         self.label_run = ttk.Label(screen, text = "", font = ("Consolas", 11), foreground = "green")
         self.label_run.grid(row = 1, column = 0, sticky = "w", pady = (0, 6))
@@ -446,6 +450,7 @@ class Application(ttk.Frame):
             kind  = event["kind"]
 
             if kind == "started":
+                self.restarting = False
                 self.report([], notes = [f"Running {event['name']}..."])
                 self.refresh_controls()
 
@@ -463,6 +468,9 @@ class Application(ttk.Frame):
             elif kind == "failed":
                 self.report([f"{event['name']} could not run - {event['message']}"])
                 self.refresh_controls()
+
+            elif kind == "stopped" and self.restarting:
+                continue   # the old run dying as part of a restart
 
             elif kind in ("finished", "stopped"):
                 verb = "finished" if kind == "finished" else "stopped"
@@ -501,10 +509,11 @@ class Application(ttk.Frame):
         return "   ".join([f"> {targets[0]}"] + targets[1:])
 
     def refresh_controls(self):
-        running = self.runner.running()
+        running = self.runner.running() or self.restarting
         state   = ["!disabled"] if running else ["disabled"]
 
-        self.button_start.configure(text = "Stop timer" if running else "Start timer")
+        self.button_start.configure(text = "Restart timer" if running else "Start timer")
+        self.button_stop.state(state)
 
         for button in self.buttons_shift.values(): button.state(state)
 
@@ -690,26 +699,56 @@ class Application(ttk.Frame):
         self.active.set(names[(index + delta) % len(names)])
 
     def on_start(self):
-        if self.runner.running():
-            self.on_stop()
+        if self.runner.running() or self.restarting:
+            self.on_restart()
             return
 
+        self.begin_run()
+
+    def begin_run(self):
         errors = self.commit_timers()
 
         if errors:
             self.report(errors)
-            return
+            return False
 
         name = self.active.get()
 
         if name not in self.timers:
             self.report(["Select a timer first."])
-            return
+            return False
 
         self.runner.start(name, self.timers[name])
         self.refresh_controls()
 
+        return True
+
+    def on_restart(self):
+        """Kill the run and start a fresh one.
+
+        The worker cannot notice the stop while it is inside a blocking write,
+        so the handover waits on the Tk event loop rather than joining here -
+        joining would freeze the window for the length of a beep sequence.
+        """
+        self.restarting = True
+
+        self.report([], notes = ["Restarting..."])
+        self.runner.stop()
+        self.resume_after_stop()
+
+    def resume_after_stop(self):
+        if not self.winfo_exists(): return
+
+        if self.runner.running():
+            self.after(10, self.resume_after_stop)
+            return
+
+        if not self.begin_run():
+            self.restarting = False
+            self.refresh_controls()
+
     def on_stop(self):
+        self.restarting = False
         self.runner.stop()
 
     def on_edit(self, name):
@@ -786,6 +825,7 @@ class Application(ttk.Frame):
     def on_close(self):
         if not self.confirm_discard(): return
 
+        self.restarting = False
         self.runner.stop()
         self.runner.join(timeout = 2.0)
 
