@@ -13,6 +13,7 @@ from src.config import PATH_FILE, config, timers
 KEYBINDS = [
     "start_restart",
     "next",
+    "previous",
     "reset",
     "terminate",
     "variable_frame",
