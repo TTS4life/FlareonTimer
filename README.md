@@ -4,23 +4,22 @@ An alternate timer to FlowTimer in Python used specifically for the RCE manip ro
 
 
 # Usage
-If using the uncompiled version, clone the repo and run
+Run the .exe. 
 
-```
+The UI now allows for you to set all your options alongside variable offsets without the need of directly editing json files.
+
+
+If you plan on contributing or want to run the python straight up, continue reading.
+
+
+If using the uncompiled version, clone the source code under the Releases page and run the following 2 commands
+
+```bash
+pip install -r requirements.txt #Only need to run for initial setup
 python3 flareontimer.py
 ```
 
-Note: Will need sounddevice among others from pip or another python package distribution of your choice. Should be easy to tell what you're missing if you know what you're doing.
 
-
-Otherwise, if using Windows, you can use the included .exe in the Releases section.
-
-Note if using WSL it will not work for running this program as WSL doesn't have a native audio output device.
-
-To modify your offsets, alter the `timers.json`.
-
-To alter hotkeys for interacting with the tool, modify `config.json`
-
-If using the .exe version, these json files are under `_internal/assets`, otherwise just `/assets`
-
-All development and maintenance has been done by Flareon, I am only hosting this on his behalf per his request. This program comes as-is for now. 
+## Contributors 
+Flareon1693 - Initial project setup
+Sidosh - UI, tests 
